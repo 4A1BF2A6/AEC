@@ -1,3 +1,29 @@
+/*
+ * aec_v2.c — 声学回声消除核心实现
+ *
+ * 整体处理流程（每调用一次 AECV2_Process 处理 64 个采样）：
+ *
+ *  AECV2_Process
+ *   ├─ 1. 远端/近端信号拼接上帧构成 128 点，FFT → farend_fft / nearend_fft
+ *   ├─ 2. 更新远端功率谱 xPow、近端功率谱 dPow
+ *   ├─ 3. 更新噪声估计 dMinPow（最小值追踪），用于舒适噪声
+ *   ├─ 4. EchoSubtraction（线性回声消除 Stage1）
+ *   │    ├─ 更新远端 FFT 环形缓冲 xfBuf（PBFDAF 用）
+ *   │    ├─ FilterFar：ŝ = Σ X_k·H_k（12 分区卷积，频域）
+ *   │    ├─ IFFT(ŝ) 得时域回声估计 s，误差 e = d - s
+ *   │    ├─ ScaleErrorSignal：NLMS 归一化 + 步长 μ + 误差限幅
+ *   │    └─ FilterAdaptation：H += IFFT(X*·E)→FFT（频域 LMS 系数更新）
+ *   └─ 5. EchoSuppression（非线性回声抑制 Stage2 / NLP）
+ *        ├─ 近端/误差/远端三路加窗 FFT → dfw / efw / xfw
+ *        ├─ UpdateCoherenceSpectra：平滑功率谱 sd/se/sx 和互功率谱 sde/sxd
+ *        ├─ ComputeCoherence：cohde（近端-误差相干）、cohxd（近端-远端相干）
+ *        ├─ FormSuppressionGain：状态机判断说话状态 → 生成 hNl 抑制增益
+ *        ├─ Overdrive：对 hNl 做非线性放大（指数曲线），高频额外压制
+ *        ├─ Suppress：efw *= hNl（频域乘法）
+ *        ├─ ComfortNoise：注入舒适噪声，避免完全静音的人工感
+ *        └─ ScaledInverseFft + overlap-add → 时域输出
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,7 +32,7 @@
 #include "ooura_fft/ooura_fft.h"
 #include "aec_v2.h"
 
-bool use_sse2_;
+bool use_sse2_; /* 运行时 SSE2 特性标志，由 AECV2_Create 检测 */
 
 #if defined(ARCH_X86_FAMILY)
 // List of features in x86.
@@ -208,7 +234,13 @@ static int CmpFloat(const void* a, const void* b) {
   return (*da > *db) - (*da < *db);
 }
 
-// Window time domain data to be used by the fft.
+/*
+ * 对 128 点时域信号加 sqrt(Hanning) 窗
+ * overlap-save 中窗函数分两半：
+ *   前 64 点：x[i]          * sqrtHanning[i]         （上升沿）
+ *   后 64 点：x[PART_LEN+i] * sqrtHanning[PART_LEN-i]（下降沿）
+ * 两帧拼接后加窗，时域乘以窗函数 = 频域卷积的辅助手段，减少 FFT 泄漏
+ */
 __inline static void WindowData(float* x_windowed, const float* x) {
   int i;
   for (i = 0; i < PART_LEN; i++) {
@@ -269,6 +301,18 @@ __inline static float MulIm(float aRe, float aIm, float bRe, float bIm) {
   return aRe * bIm + aIm * bRe;
 }
 
+/*
+ * Stage1 步骤①：频域回声估计  ŝ(f) = Σ_{k=0}^{11} X_k(f) · H_k(f)
+ *
+ * PBFDAF 核心，将 12 分区的远端 FFT 历史与滤波器系数复数相乘累加。
+ * 等价于时域 12×64 点的 FIR 长卷积，但在频域分区完成效率更高。
+ *
+ * 参数：
+ *   x_fft_buf_block_pos : 环形缓冲写指针（最新帧位置）
+ *   x_fft_buf           : 远端 FFT 环形缓冲（实/虚，12×65）
+ *   h_fft_buf           : 自适应滤波器系数频域表示（12 分区）
+ *   y_fft               : 输出回声估计频谱（调用前须清零）
+ */
 static void FilterFar_C(int num_partitions,
                       int x_fft_buf_block_pos,
                       float x_fft_buf[2][kNormalNumPartitions * PART_LEN1],
@@ -316,6 +360,24 @@ static void FilterFar(int num_partitions,
 }
 
 
+/*
+ * Stage1 步骤②：NLMS 误差信号缩放（归一化 + 步长 + 限幅）
+ *
+ * 标准 NLMS 更新公式：ΔH = μ · E(f) / xPow(f)
+ * 本函数对误差频谱 ef 做原地修改：ef = μ · clip(ef / xPow)
+ *
+ *   ① ef /= xPow：归一化，消除远端信号幅度对步长的影响
+ *   ② 若 |ef| > error_threshold：将 ef 缩放至阈值附近
+ *      作用一：防止滤波器系数溢出（远端近零时 xPow≈0 导致 ef 暴涨）
+ *      作用二：双讲时误差突然变大，限幅防止步长过大破坏已收敛的系数
+ *   ③ ef *= μ：乘以步长（默认 0.5，越大收敛越快但越不稳定）
+ *
+ * 参数：
+ *   mu              : NLMS 步长，默认 0.5
+ *   error_threshold : 误差限幅阈值，默认 1.5e-6
+ *   x_pow           : 远端功率谱（已平滑），作为 NLMS 归一化分母
+ *   ef              : 误差信号频谱（原地修改，输出为缩放后的 ΔH 频域）
+ */
 static void ScaleErrorSignal_C(float mu,
                              float error_threshold,
                              float x_pow[PART_LEN1],
@@ -383,6 +445,19 @@ static void ScaleErrorSignal(float mu,
   #endif
 }
 
+/*
+ * Stage1 步骤③：频域 LMS 滤波器系数更新
+ *
+ * PBFDAF 系数更新规则（约束时域 LMS，带 overlap-save 窗约束）：
+ *   对每个分区 k：
+ *     grad_k = IFFT(X_k* · E)   （频域互相关，取前 64 点，后 64 点清零）
+ *     H_k   += FFT(grad_k)       （重新变换回频域，叠加到滤波器系数）
+ *
+ * 为什么要 IFFT→清后半段→再 FFT（而不是直接 H += X*·E）？
+ *   频域直接相乘等价于时域循环卷积，长度会超出 64 点产生时域混叠。
+ *   通过 IFFT→清后半段（强制因果约束）→FFT，保证等价于线性卷积，
+ *   这是 overlap-save PBFDAF 的标准约束步骤。
+ */
 static void FilterAdaptation_C(
     int num_partitions,
     int x_fft_buf_block_pos,
@@ -513,6 +588,24 @@ static int PartitionDelay(
 //
 // In addition to updating the PSDs, also the filter diverge state is
 // determined.
+/*
+ * Stage2 步骤①：更新功率谱与互功率谱（指数平滑）
+ *
+ * 更新以下 5 个量（α = ptrGCoh[0]，β = ptrGCoh[1]，α+β=1）：
+ *   sd[i]    = α·sd[i]    + β·|D(f)|²          （近端功率谱）
+ *   se[i]    = α·se[i]    + β·|E(f)|²          （误差功率谱）
+ *   sx[i]    = α·sx[i]    + β·max(|X(f)|²,kMin) （远端功率谱，下界保护）
+ *   sde[i]   = α·sde[i]   + β·D(f)·E*(f)       （近端-误差互功率谱）
+ *   sxd[i]   = α·sxd[i]   + β·D(f)·X*(f)       （远端-近端互功率谱）
+ *
+ * 平滑系数选取：
+ *   mult=1（8kHz）  → α=0.90，β=0.10
+ *   mult≥2（16/48kHz）→ α=0.93，β=0.07（更平滑，适合更高采样率）
+ *
+ * 滤波器发散检测：
+ *   若 seSum > sdSum     → 误差能量超过近端能量，标记发散（输出近端原信号）
+ *   若 seSum > 20×sdSum  → 严重发散，清零滤波器系数重新收敛
+ */
 static void UpdateCoherenceSpectra_C(int mult,
                                    float efw[2][PART_LEN1],
                                    float dfw[2][PART_LEN1],
@@ -584,6 +677,22 @@ static void UpdateCoherenceSpectra(int mult,
   #endif
 }
 
+/*
+ * Stage2 步骤②：计算子带相干度
+ *
+ * 相干度定义（取值 0~1）：
+ *   cohde[i] = |sde[i]|² / (sd[i] · se[i])
+ *            = 近端与误差信号的归一化互相关能量
+ *     → 趋近 1：近端与误差高度相似，说明滤波器没有消除回声（近端说话或滤波器未收敛）
+ *     → 趋近 0：近端与误差不相似，说明滤波器已有效消除了回声（纯回声场景）
+ *
+ *   cohxd[i] = |sxd[i]|² / (sx[i] · sd[i])
+ *            = 远端与近端信号的归一化互相关能量
+ *     → 趋近 1：远端与近端高度相似，说明近端主要是回声
+ *     → 趋近 0：远端与近端不相似，说明近端是本地语音（或静音）
+ *
+ * 这两个相干度是 Stage2 状态判断和增益计算的核心输入。
+ */
 static void ComputeCoherence_C(const CoherenceState* coherence_state,
                              float* cohde,
                              float* cohxd) {
@@ -623,6 +732,31 @@ static void ComputeCoherence(const CoherenceState* coherence_state,
   #endif  
 }
 
+/*
+ * Stage2 步骤④：非线性 Overdrive（对抑制增益做指数放大）
+ *
+ * hNl[i] 的原始值由 FormSuppressionGain 计算，范围 [0,1]。
+ * 直接用 hNl 乘以误差信号往往残余回声仍较多，需要进一步压制。
+ *
+ * 处理分两步：
+ *
+ * 步骤 A：子带加权（高频额外压制）
+ *   对 hNl[i] > hNlFb 的频带（回声泄漏较多的频带）：
+ *     hNl[i] = weightCurve[i]·hNlFb + (1-weightCurve[i])·hNl[i]
+ *   weightCurve 随频率升高而增大（i=0 为 0，i=64 约 0.4），
+ *   高频受更强拉低，符合人声高频弱、高频回声可更激进压制的特点。
+ *
+ * 步骤 B：指数放大
+ *   hNl[i] = hNl[i] ^ (overdrive_scaling · overDriveCurve[i])
+ *   由于 hNl[i] ∈ [0,1]，指数 > 1 时 hNl 会变得更小（压制更强）。
+ *   overDriveCurve 随频率升高（从 1.0 到 2.0），高频衰减比低频更快。
+ *
+ * 步骤 C：全频带门限（调试参数）
+ *   若低频段（i=2~14）的 hNl 总和 < 1.25，或全频段 < 2.5，
+ *   则认为处于强回声状态，将所有 hNl 清零（全频带压制）。
+ *
+ * overdrive_scaling 由 FormSuppressionGain 动态更新，越大压制越强。
+ */
 static void Overdrive_C(float overdrive_scaling,
                         const float hNlFb,
                         float hNl[PART_LEN1]) {
@@ -765,6 +899,26 @@ static void Suppress(const float hNl[PART_LEN1], float efw[2][PART_LEN1]) {
   #endif
 }
 
+/*
+ * Stage1 主函数：线性回声消除（PBFDAF-NLMS）
+ *
+ * 输入：
+ *   x_fft     : 当前帧远端信号 FFT（实/虚拼接，2×65 = 130 个 float）
+ *   y         : 当前帧近端时域信号（64 点）
+ *   x_pow     : 远端平滑功率谱（65 点，NLMS 归一化分母）
+ *   h_fft_buf : 自适应滤波器系数（12 分区频域，双精度写入）
+ * 输出：
+ *   echo_subtractor_output : 线性消除后的误差信号 e = d - ŝ（64 点）
+ *
+ * 执行顺序：
+ *   ① 更新远端 FFT 环形缓冲（xfBuf），写入最新帧
+ *   ② 严重发散时清零滤波器
+ *   ③ FilterFar：利用 12 分区历史计算回声估计 ŝ(频域) → IFFT → 时域 s
+ *   ④ e = y - s（时域相减）
+ *   ⑤ ScaleErrorSignal：NLMS 归一化 + 限幅 + 乘步长 → 滤波器更新量
+ *   ⑥ FilterAdaptation：H += ΔH（时域约束 + 重新 FFT）
+ *   ⑦ 将 e 写入 echo_subtractor_output 供 Stage2 使用
+ */
 static void EchoSubtraction(int num_partitions,
                             int* extreme_filter_divergence,
                             float filter_step_size,
@@ -847,6 +1001,36 @@ static void EchoSubtraction(int num_partitions,
   memcpy(echo_subtractor_output, e, sizeof(float) * PART_LEN);
 }
 
+/*
+ * Stage2 步骤③：根据相干度生成 NLP 抑制增益 hNl[i] ∈ [0,1]
+ *
+ * 状态判断依据（基于 2~14 频带的平均相干度）：
+ *
+ *   hNlDeAvg = mean(cohde[2..14])   近端-误差相干度均值
+ *   hNlXdAvg = 1 - mean(cohxd[2..14])  近端-远端不相似度均值
+ *
+ *   ┌─────────────────┬───────────────┬────────────────┐
+ *   │     状态        │  hNlDeAvg     │   hNlXdAvg     │
+ *   ├─────────────────┼───────────────┼────────────────┤
+ *   │ 只有近端说话    │  ≈ 1（很相似）│  ≈ 1（不相似） │
+ *   │ 双讲            │  中等         │   中等          │
+ *   │ 纯回声          │  ≈ 0（不相似）│  ≈ 0（很相似） │
+ *   └─────────────────┴───────────────┴────────────────┘
+ *
+ * hNl 计算规则（按状态分支）：
+ *   hNlXdAvgMin == 1（长期无回声）:
+ *     近端说话 → hNl = cohde（几乎不压制）
+ *     其他     → hNl = 1 - cohxd（中等压制）
+ *   hNlXdAvgMin < 1（曾检测到回声）:
+ *     近端说话 → hNl = cohde（不压制）
+ *     回声/双讲→ hNl = min(cohde, 1-cohxd)（取更保守的值）
+ *
+ * overdrive 更新逻辑：
+ *   hNlFbLow（hNl 低频中位数）< 0.6 时更新 hNlFbMin 历史最小值；
+ *   发现新最小值后的第 2 次迭代，按目标压制量重新计算 overDrive：
+ *     overDrive = max(kTargetSupp[mode] / log(hNlFbMin), kNormalMinOverDrive[mode])
+ *   overdrive_scaling 以 0.99/0.9 的惯性系数平滑跟踪 overDrive。
+ */
 static void FormSuppressionGain(AECV2* aecv2,
                                 float cohde[PART_LEN1],
                                 float cohxd[PART_LEN1],
@@ -1068,6 +1252,27 @@ static void ComfortNoise(uint32_t* seed,
   }
 }
 
+/*
+ * Stage2 主函数：非线性回声抑制（NLP）
+ *
+ * 输入：
+ *   nearend_overlap        : 近端信号 128 点（上帧 64 + 本帧 64，overlap-save）
+ *   farend_overlap         : 远端信号 128 点（加窗 FFT 用于相干性分析）
+ *   echo_subtractor_output : Stage1 输出的线性误差信号 e（64 点）
+ * 输出：
+ *   output : 最终回声消除结果（64 点，经 overlap-add 重建）
+ *
+ * 执行顺序：
+ *   ① 三路信号加窗 FFT → efw（误差）、dfw（近端）、xfw（远端，延迟补偿）
+ *   ② UpdateCoherenceSpectra：平滑功率谱 sd/se/sx 和互功率谱 sde/sxd
+ *   ③ ComputeCoherence：计算 cohde 和 cohxd
+ *   ④ divergeState 检测：发散时 efw = dfw（直接用近端）
+ *   ⑤ FormSuppressionGain：状态机 → hNl（含 overdrive）
+ *   ⑥ Suppress：efw *= hNl（频域乘法抑制）
+ *   ⑦ ComfortNoise：注入舒适噪声（与 hNl 互补，保持自然感）
+ *   ⑧ ScaledInverseFft：IFFT 还原时域
+ *   ⑨ Overlap-Add 输出 + 饱和保护
+ */
 static void EchoSuppression(AECV2* aecv2,
                             float* nearend_overlap,
                             float farend_overlap[PART_LEN2],
@@ -1186,6 +1391,19 @@ static void EchoSuppression(AECV2* aecv2,
   memmove(aecv2->xfwBuf + PART_LEN1, aecv2->xfwBuf, sizeof(aecv2->xfwBuf) - sizeof(complex_t) * PART_LEN1);
 }
 
+/*
+ * 主处理接口：每次处理 PART_LEN=64 个采样
+ *
+ * 数据流：
+ *   farEnd(64) ──┬── overlap-save 128点 ──► FFT ──► farend_fft
+ *                └── 更新 xPow（远端平滑功率谱）
+ *
+ *   nearEnd(64) ─┬── overlap-save 128点 ──► FFT ──► nearend_fft
+ *                └── 更新 dPow（近端平滑功率谱）→ dMinPow（舒适噪声估计）
+ *
+ *   EchoSubtraction(farend_fft, nearEnd, xPow, wfBuf) → e[64]
+ *   EchoSuppression(nearend_overlap, farend_overlap, e) → output[64]
+ */
 void AECV2_Process(AECV2 *aecv2, float* farEnd, float* nearEnd,float* output){
   int i;
 
@@ -1309,7 +1527,7 @@ void AECV2_Process(AECV2 *aecv2, float* farEnd, float* nearEnd,float* output){
                   output);
 }
 
-AECV2 *AECV2_Create(){
+AECV2 *AECV2_Create(void){
   int i;
   
   #if defined(ARCH_X86_FAMILY)

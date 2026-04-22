@@ -10,13 +10,13 @@ if not exist %VCVARS% (
 call %VCVARS% > nul 2>&1
 
 echo Compiling aec_test.exe (synthetic test)...
-cl.exe /nologo /std:c11 /O2 /W3 /I. /Iooura_fft /MT ^
+cl.exe /nologo /std:c11 /O2 /W3 /utf-8 /I. /Iooura_fft /MT ^
     aec_v2.c ooura_fft\ooura_fft.c ooura_fft\ooura_fft_mips.c test_main.c ^
     /Fe:aec_test.exe
 if %ERRORLEVEL% neq 0 ( echo Build failed & exit /b 1 )
 
 echo Compiling aec_wav.exe (WAV file processor)...
-cl.exe /nologo /std:c11 /O2 /W3 /I. /Iooura_fft /MT ^
+cl.exe /nologo /std:c11 /O2 /W3 /utf-8 /I. /Iooura_fft /MT ^
     aec_v2.c ooura_fft\ooura_fft.c ooura_fft\ooura_fft_mips.c test_real.c ^
     /Fe:aec_wav.exe
 if %ERRORLEVEL% neq 0 ( echo Build failed & exit /b 1 )
