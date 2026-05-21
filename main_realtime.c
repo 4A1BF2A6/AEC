@@ -29,6 +29,9 @@
 #include <string.h>
 #include <math.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "portaudio.h"
 #include "aec_v2.h"
@@ -93,6 +96,16 @@ static void print_meter(const char *label, float db) {
  * 主函数
  * ================================================================ */
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    /* 启用 ANSI 转义码支持（Windows 10+） */
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+
     PaError err = Pa_Initialize();
     if (err != paNoError) {
         fprintf(stderr, "Pa_Initialize failed: %s\n", Pa_GetErrorText(err));
@@ -102,21 +115,23 @@ int main(int argc, char *argv[]) {
     /* ── 无参数：列出设备并退出 ── */
     if (argc < 2) {
         list_devices();
-        printf("Usage: %s <input_dev> [near_ch=0] [ref_ch=5] [total_ch=7] [output_dev=-1]\n\n", argv[0]);
-        printf("Example (device 3, default channels):\n");
-        printf("  %s 3\n\n", argv[0]);
-        printf("Example (custom channels, no playback):\n");
-        printf("  %s 3 0 5 7 -2\n\n", argv[0]);
+        printf("Usage: %s <input_dev> [near=0] [ref=5] [total_ch=7] [out_dev=-1] [sample_rate=auto]\n\n", argv[0]);
+        printf("  sample_rate : 0 or omit = 自动使用设备默认采样率\n\n");
+        printf("Examples:\n");
+        printf("  %s 6              用设备6，采样率自动检测\n", argv[0]);
+        printf("  %s 6 0 5 7 -1    自动采样率，默认输出设备播放\n", argv[0]);
+        printf("  %s 6 0 5 7 10 48000  强制指定 48kHz\n\n", argv[0]);
         Pa_Terminate();
         return 0;
     }
 
     /* ── 解析参数 ── */
-    int in_dev   = atoi(argv[1]);
-    int near_ch  = (argc > 2) ? atoi(argv[2]) : 0;
-    int ref_ch   = (argc > 3) ? atoi(argv[3]) : 5;
-    int total_ch = (argc > 4) ? atoi(argv[4]) : 7;
+    int in_dev      = atoi(argv[1]);
+    int near_ch     = (argc > 2) ? atoi(argv[2]) : 0;
+    int ref_ch      = (argc > 3) ? atoi(argv[3]) : 5;
+    int total_ch    = (argc > 4) ? atoi(argv[4]) : 7;
     int out_dev_arg = (argc > 5) ? atoi(argv[5]) : -1;
+    int sample_rate = (argc > 6) ? atoi(argv[6]) : 0;  /* 0 = 自动用设备默认采样率 */
 
     int do_playback = (out_dev_arg >= -1);
     int out_dev = (out_dev_arg == -1) ? (int)Pa_GetDefaultOutputDevice() : out_dev_arg;
@@ -139,14 +154,19 @@ int main(int argc, char *argv[]) {
         Pa_Terminate(); return 1;
     }
 
+    /* 采样率：优先用用户指定，否则强制 48kHz */
+    if (sample_rate == 0)
+        sample_rate = 48000;
+
     /* ── 打印配置摘要 ── */
     printf("=== Real-time AEC ===\n");
     printf("Input  : [%d] %s\n", in_dev, in_info->name);
     printf("  total_ch=%d  near_ch=%d  ref_ch=%d\n", total_ch, near_ch, ref_ch);
-    printf("Sample : 48000 Hz, %d samples/block (%.1f ms/block)\n",
-           PART_LEN, (float)PART_LEN / 48000.0f * 1000.0f);
+    printf("Sample : %d Hz, %d samples/block (%.2f ms/block)\n",
+           sample_rate, PART_LEN, (float)PART_LEN / sample_rate * 1000.0f);
     printf("AEC    : %d partitions, filter tail=%.1f ms\n",
-           kNormalNumPartitions, (float)(kNormalNumPartitions * PART_LEN) / 48000.0f * 1000.0f);
+           kNormalNumPartitions,
+           (float)(kNormalNumPartitions * PART_LEN) / sample_rate * 1000.0f);
 
     /* ── 打开输入流（多通道，阻塞模式） ── */
     PaStreamParameters inp;
@@ -159,10 +179,12 @@ int main(int argc, char *argv[]) {
 
     PaStream *in_stream = NULL;
     err = Pa_OpenStream(&in_stream, &inp, NULL,
-                        48000.0, PART_LEN, paNoFlag, NULL, NULL);
+                        (double)sample_rate, PART_LEN, paNoFlag, NULL, NULL);
     if (err != paNoError) {
         fprintf(stderr, "Open input stream failed: %s\n", Pa_GetErrorText(err));
-        fprintf(stderr, "Tips: try WASAPI exclusive mode or check device channel count.\n");
+        fprintf(stderr, "  Device default rate: %.0f Hz\n", in_info->defaultSampleRate);
+        fprintf(stderr, "  Tip: specify sample rate explicitly: aec_rt %d %d %d %d -1 %d\n",
+                in_dev, near_ch, ref_ch, total_ch, (int)in_info->defaultSampleRate);
         Pa_Terminate(); return 1;
     }
 
@@ -192,9 +214,9 @@ int main(int argc, char *argv[]) {
     }
     printf("\n");
 
-    /* ── AEC 初始化 ── */
+    /* ── AEC 初始化（使用实际采样率） ── */
     AECV2 *aec = AECV2_Create();
-    AECV2_Init(aec, 48000, 1);
+    AECV2_Init(aec, sample_rate, 1);
 
     /* ── 启动流 ── */
     Pa_StartStream(in_stream);
@@ -231,6 +253,18 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < PART_LEN; i++) {
             near_buf[i] = in_buf[i * total_ch + near_ch];
             ref_buf[i]  = in_buf[i * total_ch + ref_ch];
+        }
+
+        /* ② 诊断：前 3 帧打印各通道原始采样值（确认通道映射） */
+        if (frame_cnt < 3) {
+            printf("[frame %ld] near_buf[0]=%.6f  ref_buf[0]=%.6f\n",
+                   frame_cnt, near_buf[0], ref_buf[0]);
+            printf("           raw ch0=%.6f ch1=%.6f ch2=%.6f ch3=%.6f ch4=%.6f ch5=%.6f ch6=%.6f\n",
+                   in_buf[0], in_buf[1], in_buf[2], in_buf[3],
+                   total_ch > 4 ? in_buf[4] : 0.0f,
+                   total_ch > 5 ? in_buf[5] : 0.0f,
+                   total_ch > 6 ? in_buf[6] : 0.0f);
+            fflush(stdout);
         }
 
         /* ③ AEC 处理

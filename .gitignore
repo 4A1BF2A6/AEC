@@ -14,8 +14,13 @@ output.wav
 near_ch*.wav
 ref_ch*.wav
 dsp_ch*.wav
+samples/*.wav
 
 # IDE
 .vs/
+.claude/
+build/
+CMakeCache.txt
+CMakeFiles/
 *.vcxproj
 *.sln

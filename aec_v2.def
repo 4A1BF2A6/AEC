@@ -1,0 +1,7 @@
+LIBRARY aec_v2
+EXPORTS
+    AECV2_Create
+    AECV2_Free
+    AECV2_Init
+    AECV2_Delay_Set
+    AECV2_Process

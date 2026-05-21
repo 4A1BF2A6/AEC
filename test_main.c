@@ -4,8 +4,8 @@
 #include <math.h>
 #include "aec_v2.h"
 
-#define SAMPLE_RATE  16000
-#define NUM_BLOCKS   600
+#define SAMPLE_RATE  48000
+#define NUM_BLOCKS   1800
 #define PI           3.14159265358979323846
 
 int main(void) {
