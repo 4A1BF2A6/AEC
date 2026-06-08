@@ -24,3 +24,6 @@ CMakeCache.txt
 CMakeFiles/
 *.vcxproj
 *.sln
+
+# Linux 编译产物
+*.so
