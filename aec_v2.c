@@ -29,7 +29,7 @@
 #include <string.h>
 #include <math.h>
 
-#include "ooura_fft/ooura_fft.h"
+#include "../_thirdparty/ooura_fft/ooura_fft.h"
 #include "aec_v2.h"
 
 bool use_sse2_; /* 运行时 SSE2 特性标志，由 AECV2_Create 检测 */
